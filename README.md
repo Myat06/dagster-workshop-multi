@@ -1,3 +1,95 @@
+# pipeline_spotify — Spotify Hit Predictor
+
+Predicts whether a Spotify track is a "hit" (top half by popularity) purely
+from its audio features (danceability, energy, valence, tempo, acousticness,
+and friends). I picked this dataset because its features are all
+human-interpretable — unlike a PCA-scrambled dataset — so the trained
+model's feature importances actually tell a story about what makes a track
+popular, instead of being a black box.
+
+Built on top of [dagster-workshop-multi](https://github.com/DanielAdif/dagster-workshop-multi),
+a multi-container Dagster workshop — see below for the base architecture
+(`pipeline_products`, `pipeline_fx`, `pipeline_ml`).
+
+## What I built
+
+- **Track:** C — MLOps pipeline
+- **Data source:** [Spotify Tracks Dataset](https://www.kaggle.com/datasets/maharshipandya/-spotify-tracks-dataset)
+  (Kaggle), ~114,000 tracks, 20 columns of audio features and metadata,
+  bundled into the pipeline as `pipeline_spotify/data/tracks.csv`
+- **Key assets:**
+  - `raw_tracks` — reads the bundled dataset CSV (the raw ingestion asset)
+  - `tracks_table` — loads `raw_tracks` into the shared warehouse as a `tracks` table
+  - `track_features` — engineers the `is_hit` label (popularity above the dataset median)
+  - `track_hit_model` — trains a `RandomForestClassifier` on 13 numeric audio features
+  - `track_hit_predictions` — scores every track and writes predictions back to the warehouse
+- **Quality gate:** `model_quality_check` — an `@asset_check` on `track_hit_model`
+  that fails the run if accuracy drops below 0.6 (the same threshold
+  `pipeline_ml` uses). The trained model actually reaches ~0.77 accuracy, well
+  clear of the gate, with `acousticness`, `danceability`, `valence`, and
+  `speechiness` coming out as the strongest predictors of a hit.
+
+## Architecture
+
+```
+                     dagster_webserver (:3000)  <-- workspace.yaml -->  dagster_daemon
+                              |                                              |
+                              +---------------------+-----------------------+
+                                                     |
+                             dagster_postgresql  (Dagster's own run/schedule/event storage)
+
+  pipeline_products (:4000)   pipeline_fx (:4001)     pipeline_ml (:4002)      pipeline_spotify (:4003)
+  fakestoreapi.com ->         api.frankfurter.app ->   trains a classifier     bundled Spotify CSV ->
+  raw_products/raw_orders     raw_exchange_rates       on products+orders,     raw_tracks, trains a
+        |                           |                  writes predictions     RandomForest hit
+        v                           v                  back                   classifier, writes
+  products, orders  --------> warehouse_postgresql <----------+                predictions back
+  tables                      (also: exchange_rates,          |                     |
+                                order_value_predictions,       +---------------------+
+                                tracks, track_hit_predictions)
+```
+
+`pipeline_spotify` is self-contained like `pipeline_products`/`pipeline_fx`
+(it doesn't read any other pipeline's tables) but follows `pipeline_ml`'s
+train/evaluate/predict pattern instead of a plain ingestion pattern.
+
+## Running it
+
+```bash
+docker compose up --build
+```
+
+Open http://localhost:3000, find `pipeline_spotify` under Deployment > Code
+Locations, and materialize its assets.
+
+## Demo
+
+![pipeline_spotify asset graph](pipeline_spotify/docs/asset-graph-demo.png)
+
+Asset graph for `refresh_spotify_job`: `raw_tracks` feeds both `tracks_table`
+and `track_features`, which trains the model and scores predictions. (This
+screenshot was captured during development, before the trained-model asset
+was renamed from `trained_model` to `track_hit_model` to avoid a key
+collision with `pipeline_ml` — see "What I'd do differently" below for more
+on the debugging that surfaced.)
+
+## What I'd do differently in production
+
+This workshop-scale pipeline simplifies several things a production MLOps
+system would need: the trained model is passed between assets as an
+in-memory pickled dict instead of being logged to a proper model registry
+(e.g. MLflow); tables are truncate-and-loaded on every run instead of
+versioned incrementally; warehouse credentials are plain environment
+variables instead of coming from a secrets manager; and a failing quality
+gate just fails the Dagster run instead of paging someone. I also hit a real
+containerization bug worth calling out: `RandomForestClassifier(n_jobs=-1)`
+spawned joblib worker processes *inside* an already-forked Dagster step
+subprocess, which exhausted Docker's default 64&nbsp;MB `/dev/shm` and
+silently killed random steps with no traceback — fixed by training
+single-threaded, since training only takes ~4 seconds either way.
+
+---
+
 # dagster-workshop-multi
 
 A multi-container introduction to [Dagster](https://dagster.io) using the
